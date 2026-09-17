@@ -3,8 +3,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+import gc
 
 import pandas as pd
 import streamlit as st
@@ -35,6 +34,7 @@ st.markdown("""
     padding: .9rem .9rem .6rem; box-shadow: 0 2px 8px rgba(16,58,94,.06);
 }
 [data-testid="stMetricLabel"] {font-weight:600; color:#4b5c6b;}
+[data-testid="stMetricValue"] {font-size: clamp(1.15rem, 2.2vw, 1.9rem); white-space: nowrap;}
 .stTabs [data-baseweb="tab"] {font-weight:600; padding: .5rem 1rem;}
 .igv-card {
     background:#fff7e6; border:1px solid #ffdf99; border-radius:12px;
@@ -82,9 +82,11 @@ def reset_state():
 
 
 def process_uploaded_files(uploaded_files):
+    """Procesa los Excel uno por uno para reducir el uso máximo de RAM."""
     reset_state()
     run_dir = tempfile.mkdtemp(prefix="control_recaudo_comisiones_")
     saved_paths = []
+
     for f in uploaded_files:
         p = os.path.join(run_dir, f.name)
         with open(p, "wb") as out:
@@ -96,46 +98,50 @@ def process_uploaded_files(uploaded_files):
     source_paths = [None] * len(saved_paths)
     errors = []
     total_rows = 0
-    done = 0
 
-    def work(i, path):
+    for i, path in enumerate(saved_paths, 1):
+        name = os.path.basename(path)
+        status.write(f"⏳ Procesando {i}/{len(saved_paths)}: {name}")
+
         src = os.path.join(run_dir, f"source_{i}.sqlite")
-        db = create_db(src)
-        n = process_to_db(path, db)
-        db.execute("CREATE INDEX IF NOT EXISTS idx_psp ON operations(psp_tin)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_com_fecha ON operations(comercio,fecha)")
-        db.commit()
-        db.close()
-        return i, src, n
+        db = None
+        try:
+            db = create_db(src)
+            n = process_to_db(path, db)
 
-    # Lectura en paralelo de los distintos Excel: cada archivo escribe en su
-    # propio SQLite, así que no hay contención entre hilos. Con varios Excel
-    # grandes esto reduce notablemente el tiempo total de carga.
-    with ThreadPoolExecutor(max_workers=min(4, len(saved_paths)) or 1) as ex:
-        futures = {ex.submit(work, i, p): p for i, p in enumerate(saved_paths, 1)}
-        for fut in as_completed(futures):
-            path = futures[fut]
-            done += 1
-            try:
-                i, src, n = fut.result()
-                source_paths[i - 1] = src
-                total_rows += n
-                status.write(f"✅ {os.path.basename(path)} — {n:,} filas")
-            except Exception as e:
-                errors.append(f"{os.path.basename(path)}: {e}")
-                status.write(f"⚠️ {os.path.basename(path)}: {e}")
-            progress_bar.progress(done / len(saved_paths))
+            db.execute("CREATE INDEX IF NOT EXISTS idx_psp ON operations(psp_tin)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_com_fecha ON operations(comercio,fecha)")
+            db.commit()
+            db.close()
+            db = None
+
+            source_paths[i - 1] = src
+            total_rows += n
+            status.write(f"✅ {i}/{len(saved_paths)} — {name} — {n:,} filas")
+        except Exception as e:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            errors.append(f"{name}: {e}")
+            status.write(f"⚠️ {i}/{len(saved_paths)} — {name}: {e}")
+
+        gc.collect()
+        progress_bar.progress(i / len(saved_paths))
 
     progress_bar.empty()
     status.empty()
 
+    valid_sources = [(i, p) for i, p in enumerate(source_paths, 1) if p]
+    if not valid_sources:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise RuntimeError("No se pudo procesar ningún archivo. Revisa los mensajes de error.")
+
     master_path = os.path.join(run_dir, "master.sqlite")
     master = sqlite3.connect(master_path)
     master.execute("CREATE TABLE IF NOT EXISTS sources (idx INTEGER PRIMARY KEY, path TEXT)")
-    master.executemany(
-        "INSERT INTO sources(idx,path) VALUES (?,?)",
-        [(i, p) for i, p in enumerate(source_paths) if p]
-    )
+    master.executemany("INSERT INTO sources(idx,path) VALUES (?,?)", valid_sources)
     master.commit()
     master.close()
 
@@ -144,8 +150,7 @@ def process_uploaded_files(uploaded_files):
     ss.total_rows = total_rows
     ss.processed_names = [os.path.basename(p) for p in saved_paths]
     ss.errors = errors
-
-
+    gc.collect()
 def get_conn():
     if ss.db_con is not None:
         return ss.db_con
@@ -165,6 +170,7 @@ def get_conn():
 
 
 def to_excel_bytes(df, sheet_name):
+    """Genera el XLSX solo cuando el usuario solicita una exportación."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name=sheet_name[:31] or "Detalle")
@@ -174,6 +180,29 @@ def to_excel_bytes(df, sheet_name):
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+def lazy_download_button(label, df_factory, file_name, sheet_name, key, disabled=False):
+    """Evita crear Excel grandes durante cada rerun de Streamlit."""
+    if disabled:
+        return
+    if st.button(f"🛠️ Preparar {label}", key=f"prepare_{key}"):
+        with st.spinner("Generando Excel..."):
+            df = df_factory()
+            if df is None or df.empty:
+                st.info("No hay datos para exportar.")
+            else:
+                data = to_excel_bytes(df, sheet_name)
+                st.download_button(
+                    label,
+                    data=data,
+                    file_name=file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_{key}",
+                    on_click="ignore",
+                )
+                del df
+                gc.collect()
 
 
 # --------------------------------------------------------------------------
@@ -187,13 +216,21 @@ with st.sidebar:
         help="Puedes subir varios Excel a la vez; se procesan y consolidan juntos.",
     )
     c1, c2 = st.columns(2)
-    procesar = c1.button("🚀 Procesar", use_container_width=True, disabled=not uploaded)
-    limpiar = c2.button("🗑 Limpiar", use_container_width=True)
+    procesar = c1.button("🚀 Procesar", width="stretch", disabled=not uploaded)
+    limpiar = c2.button("🗑 Limpiar", width="stretch")
 
     if procesar and uploaded:
-        with st.spinner("Leyendo Excel..."):
-            process_uploaded_files(uploaded)
-        st.rerun()
+        try:
+            with st.spinner("Procesando Excel uno por uno para proteger la memoria..."):
+                process_uploaded_files(uploaded)
+        except Exception as e:
+            ss.errors = [f"Error general de procesamiento: {e}"]
+            st.error(
+                "No se pudo completar el procesamiento. "
+                "La aplicación sigue abierta; revisa el detalle del error."
+            )
+        else:
+            st.rerun()
 
     if limpiar:
         reset_state()
@@ -241,7 +278,7 @@ with st.sidebar:
         tr_com = st.selectbox("Comercio", comercios_all, index=None, placeholder="Elige un comercio", key="tr_com")
         tr_d1 = st.date_input("Desde", value=None, key="tr_d1", format="DD/MM/YYYY")
         tr_d2 = st.date_input("Hasta", value=None, key="tr_d2", format="DD/MM/YYYY")
-        if st.button("➕ Agregar regla", use_container_width=True):
+        if st.button("➕ Agregar regla", width="stretch"):
             if not tr_com:
                 st.warning("Selecciona un comercio.")
             elif not tr_d1 or not tr_d2:
@@ -257,10 +294,10 @@ with st.sidebar:
         rules = con.execute("SELECT id,comercio,fecha_desde,fecha_hasta FROM test_rules ORDER BY fecha_desde,comercio").fetchall()
         if rules:
             rules_df = pd.DataFrame(rules, columns=["id", "Comercio", "Desde", "Hasta"])
-            st.dataframe(rules_df.drop(columns="id"), hide_index=True, use_container_width=True)
+            st.dataframe(rules_df.drop(columns="id"), hide_index=True, width="stretch")
             to_remove = st.multiselect("Quitar regla(s)", rules_df["id"].tolist(),
                                         format_func=lambda i: rules_df.set_index("id").loc[i, "Comercio"])
-            if to_remove and st.button("🗑 Quitar seleccionadas", use_container_width=True):
+            if to_remove and st.button("🗑 Quitar seleccionadas", width="stretch"):
                 con.executemany("DELETE FROM test_rules WHERE id=?", [(i,) for i in to_remove])
                 con.commit()
                 st.rerun()
@@ -287,7 +324,7 @@ tab_dash, tab_com, tab_mes, tab_neg = st.tabs(["📊 Dashboard", "🏪 Comercio 
 # DASHBOARD
 # --------------------------------------------------------------------------
 with tab_dash:
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Comercios", f"{coms:,}")
     if currency == "Todas":
         cur_rows = con.execute(f"SELECT moneda,SUM(recaudo),SUM(comision),SUM(neto) FROM operations WHERE {w} GROUP BY moneda ORDER BY moneda").fetchall()
@@ -306,6 +343,7 @@ with tab_dash:
         m3.metric("Comisión total", f"{sym} {sf:,.2f}")
         m4.metric("Neto", f"{sym} {net:,.2f}")
         igv_text = f"Comisión sin IGV: {sym} {sf - (sf * 18 / 118):,.2f}"
+    m5, m6 = st.columns(2)
     m5.metric("Negativos", f"{neg:,}")
     m6.metric("PSP_TIN duplicados", f"{dup_ids:,}")
 
@@ -328,11 +366,13 @@ with tab_dash:
         resumen["negativos"] = resumen.negativos.fillna(0).astype(int)
         resumen = resumen[["comercio", "moneda", "total_recaudo", "total_comision", "comision_sin_igv", "total_neto", "operaciones", "negativos"]]
 
-    st.dataframe(resumen, use_container_width=True, hide_index=True)
-    st.download_button(
-        "📥 Exportar resumen", data=to_excel_bytes(resumen, "Resumen_Comercio"),
-        file_name="Resumen_por_Comercio.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.dataframe(resumen, width="stretch", hide_index=True)
+    lazy_download_button(
+        "📥 Descargar resumen",
+        lambda: resumen.copy(),
+        "Resumen_por_Comercio.xlsx",
+        "Resumen_Comercio",
+        key="resumen",
         disabled=resumen.empty,
     )
 
@@ -341,11 +381,13 @@ with tab_dash:
         '<p class="note">Todos los PSP_TIN repetidos se muestran aquí. En el cálculo se toma una sola '
         'positiva por PSP_TIN + Moneda y el reverso negativo reduce el resultado neto.</p>', unsafe_allow_html=True)
     dup_df = query_duplicates(con, filtro, limit=5000)
-    st.dataframe(dup_df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "📥 Exportar PSP_TIN duplicados", data=to_excel_bytes(query_duplicates(con, filtro, None), "PSP_TIN_Duplicados"),
-        file_name="PSP_TIN_Duplicados.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.dataframe(dup_df, width="stretch", hide_index=True)
+    lazy_download_button(
+        "📥 Descargar PSP_TIN duplicados",
+        lambda: query_duplicates(con, filtro, None),
+        "PSP_TIN_Duplicados.xlsx",
+        "PSP_TIN_Duplicados",
+        key="psp_duplicates",
         disabled=dup_df.empty,
     )
     st.caption(f"Leídas: {ss.total_rows:,} | Base principal: {ops:,} | Negativos: {neg:,} | PSP_TIN duplicados: {dup_ids:,}")
@@ -383,35 +425,43 @@ with tab_com:
             f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
             f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {where} ORDER BY id LIMIT 5000",
             con, params=params)
-        st.dataframe(det_com, use_container_width=True, hide_index=True)
+        st.dataframe(det_com, width="stretch", hide_index=True)
         st.caption("Máximo 5,000 filas visibles en pantalla; la exportación incluye todo.")
 
         d1, d2 = st.columns(2)
         if mes_sel:
-            full_where = f"{filtro.main_where()} AND comercio=? AND substr(fecha,1,7)=?"
-            full_params = [comercio_sel, mes_sel]
-            full_df = pd.read_sql_query(
+            def make_com_month_df():
+                full_where = f"{filtro.main_where()} AND comercio=? AND substr(fecha,1,7)=?"
+                return pd.read_sql_query(
+                    f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+                    f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
+                    f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {full_where} ORDER BY id",
+                    con, params=[comercio_sel, mes_sel])
+
+            with d1:
+                lazy_download_button(
+                    "📥 Descargar comercio + mes",
+                    make_com_month_df,
+                    f"Detalle_{comercio_sel}_{mes_sel}.xlsx".replace("|", "_"),
+                    "Detalle",
+                    key="comercio_mes",
+                )
+
+        def make_com_full_df():
+            return pd.read_sql_query(
                 f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
                 f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
-                f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {full_where} ORDER BY id",
-                con, params=full_params)
-            d1.download_button(
-                "📥 Exportar comercio + mes", data=to_excel_bytes(full_df, "Detalle"),
-                file_name=f"Detalle_{comercio_sel}_{mes_sel}.xlsx".replace("|", "_"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                disabled=full_df.empty,
+                f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} AND comercio=? ORDER BY id",
+                con, params=[comercio_sel])
+
+        with d2:
+            lazy_download_button(
+                "📥 Descargar comercio completo",
+                make_com_full_df,
+                f"Detalle_{comercio_sel}.xlsx",
+                "Detalle",
+                key="comercio_completo",
             )
-        full_com_df = pd.read_sql_query(
-            f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
-            f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
-            f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} AND comercio=? ORDER BY id",
-            con, params=[comercio_sel])
-        d2.download_button(
-            "📥 Exportar comercio completo", data=to_excel_bytes(full_com_df, "Detalle"),
-            file_name=f"Detalle_{comercio_sel}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            disabled=full_com_df.empty,
-        )
     else:
         st.info("No hay comercios disponibles con los filtros actuales.")
 
@@ -429,17 +479,20 @@ with tab_mes:
             f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
             f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} "
             f"AND substr(fecha,1,7)=? ORDER BY id LIMIT 5000", con, params=[mes_general])
-        st.dataframe(det_mes, use_container_width=True, hide_index=True)
-        full_mes_df = pd.read_sql_query(
-            f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
-            f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
-            f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} "
-            f"AND substr(fecha,1,7)=? ORDER BY id", con, params=[mes_general])
-        st.download_button(
-            "📥 Exportar mes", data=to_excel_bytes(full_mes_df, str(mes_general)),
-            file_name=f"Detalle_{mes_general}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            disabled=full_mes_df.empty,
+        st.dataframe(det_mes, width="stretch", hide_index=True)
+        def make_month_df():
+            return pd.read_sql_query(
+                f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+                f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
+                f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} "
+                f"AND substr(fecha,1,7)=? ORDER BY id", con, params=[mes_general])
+
+        lazy_download_button(
+            "📥 Descargar mes",
+            make_month_df,
+            f"Detalle_{mes_general}.xlsx",
+            str(mes_general),
+            key="mes",
         )
     else:
         st.info("No hay meses disponibles con los filtros actuales.")
@@ -451,10 +504,12 @@ with tab_neg:
     st.markdown('<p class="note">Negativos separados. No aparecen en el detalle principal.</p>', unsafe_allow_html=True)
     neg_where = f"{filtro.currency_sql()} AND es_negativo=1"
     neg_df = query_details(con, neg_where, 5000)
-    st.dataframe(neg_df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "📥 Descargar negativos", data=to_excel_bytes(query_details(con, neg_where, None), "Negativos"),
-        file_name="Negativos.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.dataframe(neg_df, width="stretch", hide_index=True)
+    lazy_download_button(
+        "📥 Descargar negativos",
+        lambda: query_details(con, neg_where, None),
+        "Negativos.xlsx",
+        "Negativos",
+        key="negativos",
         disabled=neg_df.empty,
     )
