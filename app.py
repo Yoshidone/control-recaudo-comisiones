@@ -111,6 +111,8 @@ def process_uploaded_files(uploaded_files):
 
             db.execute("CREATE INDEX IF NOT EXISTS idx_psp ON operations(psp_tin)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_com_fecha ON operations(comercio,fecha)")
+            # Identificador real del comercio: se toma directamente de Com_Public_ID del Excel.
+            db.execute("CREATE INDEX IF NOT EXISTS idx_com_public_id ON operations(com_public_id)")
             db.commit()
             db.close()
             db = None
@@ -305,6 +307,10 @@ with st.sidebar:
             st.caption("No hay reglas de prueba agregadas.")
 
 # --------------------------------------------------------------------------
+# Com_Public_ID: identificador real del comercio tomado del Excel.
+# IMPORTANTE: core.process_to_db debe guardar la columna Excel Com_Public_ID
+# en operations.com_public_id; no se usa ni se crea el campo Com.
+# --------------------------------------------------------------------------
 # Consultas agregadas (idénticas al método refresh() original)
 # --------------------------------------------------------------------------
 w = filtro.calc_where()
@@ -357,14 +363,15 @@ with tab_dash:
         f"SELECT comercio,moneda,SUM(recaudo) total_recaudo,SUM(comision) total_comision,SUM(neto) total_neto,"
         f"COUNT(*) operaciones FROM operations WHERE {w} GROUP BY comercio,moneda ORDER BY comercio,moneda"
     ).fetchall()
-    resumen = pd.DataFrame(rows, columns=["comercio", "moneda", "total_recaudo", "total_comision", "total_neto", "operaciones"])
+    resumen = pd.DataFrame(rows, columns=["Com_Public_ID", "comercio", "moneda", "total_recaudo", "total_comision", "total_neto", "operaciones"])
     if not resumen.empty:
         resumen["comision_sin_igv"] = resumen.total_comision - (resumen.total_comision * 18 / 118)
         n = pd.read_sql_query(
-            f"SELECT comercio,moneda,COUNT(*) negativos FROM operations WHERE {filtro.currency_sql()} AND es_negativo=1 GROUP BY comercio,moneda", con)
-        resumen = resumen.merge(n, on=["comercio", "moneda"], how="left")
+            f"SELECT com_public_id Com_Public_ID,comercio,moneda,COUNT(*) negativos FROM operations "
+f"WHERE {filtro.currency_sql()} AND es_negativo=1 GROUP BY com_public_id,comercio,moneda", con)
+        resumen = resumen.merge(n, on=["Com_Public_ID", "comercio", "moneda"], how="left")
         resumen["negativos"] = resumen.negativos.fillna(0).astype(int)
-        resumen = resumen[["comercio", "moneda", "total_recaudo", "total_comision", "comision_sin_igv", "total_neto", "operaciones", "negativos"]]
+        resumen = resumen[["Com_Public_ID", "comercio", "moneda", "total_recaudo", "total_comision", "comision_sin_igv", "total_neto", "operaciones", "negativos"]]
 
     st.dataframe(resumen, width="stretch", hide_index=True)
     lazy_download_button(
@@ -398,22 +405,28 @@ with tab_dash:
 with tab_com:
     cc1, cc2, cc3 = st.columns([2, 1, 1.4])
     comercio_sel = cc1.selectbox("Comercio", comercios_all, index=0 if comercios_all else None, key="comercio_sel")
+    # El comercio se identifica por Com_Public_ID; el nombre solo se muestra como referencia.
+    ids_comercio = [r[0] for r in con.execute(
+        f"SELECT DISTINCT com_public_id FROM operations WHERE {filtro.main_where()} AND comercio=? "
+        "AND TRIM(COALESCE(com_public_id,''))<>'' ORDER BY com_public_id", (comercio_sel,)
+    ).fetchall()] if comercio_sel else []
+    com_public_sel = cc1.selectbox("Com_Public_ID", ids_comercio, index=0 if ids_comercio else None, key="com_public_sel")
     meses_com = [r[0] for r in con.execute(
-        f"SELECT DISTINCT substr(fecha,1,7) FROM operations WHERE {filtro.main_where()} AND comercio=? AND fecha<>'' ORDER BY 1",
-        (comercio_sel,)
+        f"SELECT DISTINCT substr(fecha,1,7) FROM operations WHERE {filtro.main_where()} AND comercio=? AND com_public_id=? AND fecha<>'' ORDER BY 1",
+        (comercio_sel, com_public_sel),
     ).fetchall()] if comercio_sel else []
     mes_sel = cc2.selectbox("Mes", meses_com, index=0 if meses_com else None, key="mes_com_sel")
     incluir_neg = cc3.checkbox("Incluir negativos/reversos en detalle (no afecta cálculos)", key="incluir_neg")
 
     if comercio_sel:
-        where = f"{filtro.main_where()} AND comercio=?"
-        params = [comercio_sel]
+        where = f"{filtro.main_where()} AND comercio=? AND com_public_id=?"
+        params = [comercio_sel, com_public_sel]
         if mes_sel:
             where += " AND substr(fecha,1,7)=?"
             params.append(mes_sel)
         if incluir_neg:
             base_sql = f"({where}) OR ({filtro.currency_sql()} AND {filtro.test_exclusion_sql()} AND es_negativo=1 AND comercio=?"
-            neg_params = [comercio_sel]
+            neg_params = [comercio_sel, com_public_sel]
             if mes_sel:
                 base_sql += " AND substr(fecha,1,7)=?"
                 neg_params.append(mes_sel)
@@ -421,7 +434,7 @@ with tab_com:
             where = base_sql
             params = params + neg_params
         det_com = pd.read_sql_query(
-            f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+            f"SELECT com_public_id Com_Public_ID,fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',
             f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
             f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {where} ORDER BY id LIMIT 5000",
             con, params=params)
@@ -431,12 +444,12 @@ with tab_com:
         d1, d2 = st.columns(2)
         if mes_sel:
             def make_com_month_df():
-                full_where = f"{filtro.main_where()} AND comercio=? AND substr(fecha,1,7)=?"
+                full_where = f"{filtro.main_where()} AND comercio=? AND com_public_id=? AND substr(fecha,1,7)=?"
                 return pd.read_sql_query(
-                    f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+                    f"SELECT com_public_id Com_Public_ID,fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',
                     f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
                     f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {full_where} ORDER BY id",
-                    con, params=[comercio_sel, mes_sel])
+                    con, params=[comercio_sel, com_public_sel, mes_sel])
 
             with d1:
                 lazy_download_button(
@@ -449,7 +462,7 @@ with tab_com:
 
         def make_com_full_df():
             return pd.read_sql_query(
-                f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+                f"SELECT com_public_id Com_Public_ID,fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',
                 f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
                 f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} AND comercio=? ORDER BY id",
                 con, params=[comercio_sel])
@@ -473,16 +486,21 @@ with tab_mes:
         f"SELECT DISTINCT substr(fecha,1,7) FROM operations WHERE {filtro.main_where()} AND fecha<>'' ORDER BY 1"
     ).fetchall()]
     mes_general = st.selectbox("Mes", meses_all, index=0 if meses_all else None, key="mes_general")
+    ids_mes = [r[0] for r in con.execute(
+        f"SELECT DISTINCT com_public_id FROM operations WHERE {filtro.main_where()} AND substr(fecha,1,7)=? "
+        "AND TRIM(COALESCE(com_public_id,''))<>'' ORDER BY com_public_id", (mes_general,)
+    ).fetchall()] if mes_general else []
+    com_public_mes = st.selectbox("Com_Public_ID", ids_mes, index=0 if ids_mes else None, key="com_public_mes")
     if mes_general:
         det_mes = pd.read_sql_query(
-            f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+            f"SELECT com_public_id Com_Public_ID,fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',
             f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
             f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} "
             f"AND substr(fecha,1,7)=? ORDER BY id LIMIT 5000", con, params=[mes_general])
         st.dataframe(det_mes, width="stretch", hide_index=True)
         def make_month_df():
             return pd.read_sql_query(
-                f"SELECT fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',"
+                f"SELECT com_public_id Com_Public_ID,fecha FECHA,comercio Com_Nombre,Deb_Doc,Deb_Nombre,psp_tin,metodo_pago 'Método de Pago',
                 f"SET_referencia,Fecha_Transferencia 'Fecha Transferencia',Banco_Transferencia 'Banco Transferencia',"
                 f"recaudo RECAUDO,comision COMISION,neto NETO FROM operations WHERE {filtro.main_where()} "
                 f"AND substr(fecha,1,7)=? ORDER BY id", con, params=[mes_general])
@@ -504,10 +522,21 @@ with tab_neg:
     st.markdown('<p class="note">Negativos separados. No aparecen en el detalle principal.</p>', unsafe_allow_html=True)
     neg_where = f"{filtro.currency_sql()} AND es_negativo=1"
     neg_df = query_details(con, neg_where, 5000)
+    if not neg_df.empty and "Com_Public_ID" not in neg_df.columns:
+        # Se conserva query_details y solo se añade el identificador desde operations.
+        neg_df = pd.read_sql_query(
+            f"SELECT com_public_id Com_Public_ID, fecha FECHA, comercio Com_Nombre, Deb_Doc, Deb_Nombre, psp_tin, "
+            f"metodo_pago 'Método de Pago', SET_referencia, Fecha_Transferencia 'Fecha Transferencia', "
+            f"Banco_Transferencia 'Banco Transferencia', recaudo RECAUDO, comision COMISION, neto NETO "
+            f"FROM operations WHERE {neg_where} ORDER BY id LIMIT 5000", con)
     st.dataframe(neg_df, width="stretch", hide_index=True)
     lazy_download_button(
         "📥 Descargar negativos",
-        lambda: query_details(con, neg_where, None),
+        lambda: pd.read_sql_query(
+            f"SELECT com_public_id Com_Public_ID, fecha FECHA, comercio Com_Nombre, Deb_Doc, Deb_Nombre, psp_tin, "
+            f"metodo_pago 'Método de Pago', SET_referencia, Fecha_Transferencia 'Fecha Transferencia', "
+            f"Banco_Transferencia 'Banco Transferencia', recaudo RECAUDO, comision COMISION, neto NETO "
+            f"FROM operations WHERE {neg_where} ORDER BY id", con),
         "Negativos.xlsx",
         "Negativos",
         key="negativos",
